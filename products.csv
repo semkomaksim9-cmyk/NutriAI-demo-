@@ -1,0 +1,288 @@
+require('dotenv').config()
+const express = require('express')
+const fs = require('fs')
+const path = require('path')
+const bodyParser = require('body-parser')
+const cors = require('cors')
+const sqlite3 = require('sqlite3').verbose()
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+const multer = require('multer')
+const Anthropic = require('@anthropic-ai/sdk')
+
+const app = express()
+app.use(cors())
+app.use(bodyParser.json())
+
+const DB_PATH = path.join(__dirname, 'data.db')
+const PRODUCTS_JSON = path.join(__dirname, 'products.json')
+const SECRET = process.env.JWT_SECRET || 'dev_secret_change_me'
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null
+
+const db = new sqlite3.Database(DB_PATH)
+
+function ensureProductColumns(callback){
+  db.all('PRAGMA table_info(products)', (err, columns)=>{
+    if(err) return callback(err)
+    const existing = new Set(columns.map(c=>c.name))
+    const statements = []
+    if(!existing.has('protein_per_100')) statements.push('ALTER TABLE products ADD COLUMN protein_per_100 REAL')
+    if(!existing.has('fat_per_100')) statements.push('ALTER TABLE products ADD COLUMN fat_per_100 REAL')
+    if(!existing.has('carbs_per_100')) statements.push('ALTER TABLE products ADD COLUMN carbs_per_100 REAL')
+
+    let index = 0
+    function next(){
+      if(index >= statements.length) return callback(null)
+      db.run(statements[index++], (error)=>{
+        if(error) return callback(error)
+        next()
+      })
+    }
+    next()
+  })
+}
+
+db.serialize(()=>{
+  db.run(`CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, name TEXT, calories_per_100 REAL, protein_per_100 REAL, fat_per_100 REAL, carbs_per_100 REAL)`) 
+  db.run(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)`)
+  db.run(`CREATE TABLE IF NOT EXISTS meals(id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, created_at TEXT, items TEXT)`)
+
+  ensureProductColumns((err)=>{
+    if(err) return console.error(err)
+
+    const importProducts = () => {
+      if(fs.existsSync(PRODUCTS_JSON)){
+        const data = JSON.parse(fs.readFileSync(PRODUCTS_JSON,'utf8'))
+        const insertStmt = db.prepare('INSERT OR IGNORE INTO products(id,name,calories_per_100,protein_per_100,fat_per_100,carbs_per_100) VALUES(?,?,?,?,?,?)')
+        const updateStmt = db.prepare('UPDATE products SET name=?, calories_per_100=?, protein_per_100=?, fat_per_100=?, carbs_per_100=? WHERE id=?')
+        data.forEach(p=>{
+          insertStmt.run(p.id, p.name, p.calories_per_100, p.protein_per_100 || 0, p.fat_per_100 || 0, p.carbs_per_100 || 0)
+          updateStmt.run(p.name, p.calories_per_100, p.protein_per_100 || 0, p.fat_per_100 || 0, p.carbs_per_100 || 0, p.id)
+        })
+        insertStmt.finalize()
+        updateStmt.finalize()
+        console.log('Products synced from JSON')
+      } else if(fs.existsSync(CSV_PATH)){
+        console.log('Products table empty — importing from products.csv')
+        const lines = fs.readFileSync(CSV_PATH, 'utf8').split(/\r?\n/)
+        const stmt = db.prepare('INSERT INTO products(id,name,calories_per_100,protein_per_100,fat_per_100,carbs_per_100) VALUES(?,?,?,?,?,?)')
+        lines.forEach((ln,idx)=>{
+          if(idx===0) return // header
+          if(!ln.trim()) return
+          const parts = ln.split(',')
+          const id = parts[0] ? parseInt(parts[0].trim()) : null
+          const name = parts[1] ? parts[1].trim() : ''
+          const kcal = parts[2] ? parseFloat(parts[2].trim()) : 0
+          const protein = parts[3] ? parseFloat(parts[3].trim()) : 0
+          const fat = parts[4] ? parseFloat(parts[4].trim()) : 0
+          const carbs = parts[5] ? parseFloat(parts[5].trim()) : 0
+          stmt.run(id, name, kcal, protein, fat, carbs)
+        })
+        stmt.finalize(()=>console.log('Products imported from CSV'))
+      } else {
+        console.log('No products source found (products.csv or products.json)')
+      }
+    }
+
+    db.get('SELECT COUNT(*) as c FROM products', (error,row)=>{
+      if(error) return console.error(error)
+      if(row.c===0){
+        importProducts()
+      } else {
+        importProducts()
+      }
+    })
+  })
+})
+
+function authenticate(req,res,next){
+  const auth = req.headers.authorization
+  if(!auth) return res.status(401).json({error:'no token'})
+  const token = auth.split(' ')[1]
+  jwt.verify(token, SECRET, (err, decoded)=>{
+    if(err) return res.status(401).json({error:'invalid token'})
+    req.user = decoded
+    next()
+  })
+}
+
+app.post('/api/meals', authenticate, (req,res)=>{
+  const {name, items} = req.body
+  const itemsJson = JSON.stringify(items || [])
+  const created_at = new Date().toISOString()
+  db.run('INSERT INTO meals(user_id,name,created_at,items) VALUES(?,?,?,?)', [req.user.id, name || 'Meal', created_at, itemsJson], function(err){
+    if(err) return res.status(500).json({error:err.message})
+    res.json({id: this.lastID})
+  })
+})
+
+app.get('/api/meals', authenticate, (req,res)=>{
+  db.all('SELECT id,name,created_at,items FROM meals WHERE user_id=? ORDER BY created_at DESC', [req.user.id], (err,rows)=>{
+    if(err) return res.status(500).json({error:err.message})
+    rows.forEach(r=>{ try{ r.items = JSON.parse(r.items) }catch(e){ r.items = [] } })
+    res.json(rows)
+  })
+})
+
+app.put('/api/meals/:id', authenticate, (req,res)=>{
+  const id = req.params.id
+  const {name, items} = req.body
+  db.get('SELECT user_id FROM meals WHERE id=?', [id], (err,row)=>{
+    if(err) return res.status(500).json({error:err.message})
+    if(!row) return res.status(404).json({error:'not found'})
+    if(row.user_id !== req.user.id) return res.status(403).json({error:'forbidden'})
+    const itemsJson = JSON.stringify(items || [])
+    db.run('UPDATE meals SET name=?, items=? WHERE id=?', [name || 'Meal', itemsJson, id], function(err){
+      if(err) return res.status(500).json({error:err.message})
+      res.json({updated: this.changes})
+    })
+  })
+})
+
+app.delete('/api/meals/:id', authenticate, (req,res)=>{
+  const id = req.params.id
+  db.get('SELECT user_id FROM meals WHERE id=?', [id], (err,row)=>{
+    if(err) return res.status(500).json({error:err.message})
+    if(!row) return res.status(404).json({error:'not found'})
+    if(row.user_id !== req.user.id) return res.status(403).json({error:'forbidden'})
+    db.run('DELETE FROM meals WHERE id=?', [id], function(err){
+      if(err) return res.status(500).json({error:err.message})
+      res.json({deleted: this.changes})
+    })
+  })
+})
+
+app.post('/api/food-photo', upload.single('photo'), async (req, res) => {
+  if (!anthropic) return res.status(503).json({ error: 'ai_not_configured' })
+  if (!req.file) return res.status(400).json({ error: 'no_photo' })
+
+  try {
+    const base64Image = req.file.buffer.toString('base64')
+    const mediaType = req.file.mimetype
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Image } },
+          {
+            type: 'text',
+            text: 'Определи блюда/продукты на фото и оцени порцию по объёму на тарелке. ' +
+              'Ответь ТОЛЬКО валидным JSON-объектом без пояснений и markdown, в формате: ' +
+              '{"dish_name":"общее название блюда на русском, коротко","health_score":число от 1 до 10 (оценка пользы для здоровья),' +
+              '"items":[{"name":"строка на русском","grams":число,"kcal":число,"protein":число,"fat":число,"carbs":число}]}. ' +
+              'Значения kcal/protein/fat/carbs в каждом item — на всю оценённую порцию этого ингредиента (не на 100г). ' +
+              'Если на фото нет еды, верни {"dish_name":"","health_score":0,"items":[]}.'
+          }
+        ]
+      }]
+    })
+
+    const textBlock = message.content.find(c => c.type === 'text')
+    const raw = (textBlock && textBlock.text) || '{}'
+    const clean = raw.replace(/```json|```/g, '').trim()
+
+    let parsed
+    try {
+      parsed = JSON.parse(clean)
+    } catch (parseErr) {
+      return res.status(502).json({ error: 'bad_ai_response' })
+    }
+
+    const items = Array.isArray(parsed.items) ? parsed.items : []
+    if (items.length === 0) return res.status(502).json({ error: 'bad_ai_response' })
+
+    res.json({
+      dish_name: parsed.dish_name || items[0].name || '',
+      health_score: Number(parsed.health_score) || 0,
+      items
+    })
+  } catch (err) {
+    console.error('food-photo error:', err.message)
+    res.status(500).json({ error: 'recognition_failed' })
+  }
+})
+
+app.get('/api/products', (req,res)=>{
+  const q = req.query.q || ''
+  const like = `%${q}%`
+  db.all('SELECT id,name,calories_per_100,protein_per_100,fat_per_100,carbs_per_100 FROM products WHERE name LIKE ? LIMIT 50', [like], (err,rows)=>{
+    if(err) return res.status(500).json({error:err.message})
+    res.json(rows)
+  })
+})
+
+app.post('/api/register', async (req,res)=>{
+  const {username,password} = req.body
+  if(!username || !password) return res.status(400).json({error:'username/password required'})
+  const hash = await bcrypt.hash(password,8)
+  db.run('INSERT INTO users(username,password) VALUES(?,?)',[username,hash], function(err){
+    if(err) return res.status(400).json({error:err.message})
+    const token = jwt.sign({id:this.lastID,username}, SECRET)
+    res.json({token})
+  })
+})
+
+app.post('/api/login', (req,res)=>{
+  const {username,password} = req.body
+  if(!username || !password) return res.status(400).json({error:'username/password required'})
+  db.get('SELECT id,username,password FROM users WHERE username=?',[username], async (err,row)=>{
+    if(err) return res.status(500).json({error:err.message})
+    if(!row) return res.status(400).json({error:'invalid credentials'})
+    const ok = await bcrypt.compare(password,row.password)
+    if(!ok) return res.status(400).json({error:'invalid credentials'})
+    const token = jwt.sign({id:row.id,username:row.username}, SECRET)
+    res.json({token})
+  })
+})
+
+app.post('/api/calc', (req,res)=>{
+  const items = req.body.items || []
+  if(!Array.isArray(items)) return res.status(400).json({error:'items should be array'})
+  const ids = items.map(i=>i.id)
+  if(ids.length===0) return res.json({totalCalories:0,totalProtein:0,totalFat:0,totalCarbs:0})
+
+  const placeholders = ids.map(()=>'?').join(',')
+  db.all(`SELECT id,calories_per_100,protein_per_100,fat_per_100,carbs_per_100 FROM products WHERE id IN (${placeholders})`, ids, (err,rows)=>{
+    if(err) return res.status(500).json({error:err.message})
+    const map = {}
+    rows.forEach(r=> map[r.id] = {
+      calories_per_100: r.calories_per_100,
+      protein_per_100: r.protein_per_100,
+      fat_per_100: r.fat_per_100,
+      carbs_per_100: r.carbs_per_100
+    })
+
+    let totalCalories = 0
+    let totalProtein = 0
+    let totalFat = 0
+    let totalCarbs = 0
+
+    items.forEach(it=>{
+      const grams = it.grams || 100
+      const item = map[it.id] || {
+        calories_per_100: it.calories_per_100 || 0,
+        protein_per_100: it.protein_per_100 || 0,
+        fat_per_100: it.fat_per_100 || 0,
+        carbs_per_100: it.carbs_per_100 || 0
+      }
+      totalCalories += (item.calories_per_100 * grams) / 100
+      totalProtein += (item.protein_per_100 * grams) / 100
+      totalFat += (item.fat_per_100 * grams) / 100
+      totalCarbs += (item.carbs_per_100 * grams) / 100
+    })
+
+    res.json({
+      totalCalories: Math.round(totalCalories),
+      totalProtein: Math.round(totalProtein * 10) / 10,
+      totalFat: Math.round(totalFat * 10) / 10,
+      totalCarbs: Math.round(totalCarbs * 10) / 10
+    })
+  })
+})
+
+app.listen(3000, ()=>console.log('Server listening on http://localhost:3000'))

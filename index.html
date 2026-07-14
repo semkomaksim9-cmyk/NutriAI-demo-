@@ -1,0 +1,217 @@
+import React, { useEffect, useMemo, useState } from 'react'
+import {
+  Crown,
+  Sparkles,
+  Zap,
+  BrainCircuit,
+  Save,
+  History,
+  LayoutDashboard,
+  Wand2,
+  Gauge,
+  ShieldCheck,
+  X,
+} from 'lucide-react'
+import './PremiumPaywall.css'
+
+const BENEFITS = [
+  { icon: Sparkles, label: 'Unlimited AI Food Recognition' },
+  { icon: Zap, label: 'Instant Calories & Macros' },
+  { icon: BrainCircuit, label: 'Smart AI Nutrition Analysis' },
+  { icon: Save, label: 'Save Unlimited Meals' },
+  { icon: History, label: 'Meal History' },
+  { icon: LayoutDashboard, label: 'Daily Nutrition Dashboard' },
+  { icon: Wand2, label: 'Personalized AI Recommendations' },
+  { icon: Gauge, label: 'Faster AI Processing' },
+]
+
+/**
+ * Ultra-premium subscription paywall.
+ *
+ * Props:
+ *  - open: boolean            whether the sheet/modal is visible
+ *  - onClose: () => void      "Maybe Later" / close (X) handler
+ *  - onSubscribe: (planId) => void   called with 'monthly' | 'yearly' when user taps "Start Premium"
+ *  - scansUsed: number        how many free scans have been used (defaults to 3)
+ *  - scanLimit: number        total free scans allowed (defaults to 3)
+ */
+export default function PremiumPaywall({
+  open,
+  onClose,
+  onSubscribe,
+  scansUsed = 3,
+  scanLimit = 3,
+}) {
+  const [selectedPlan, setSelectedPlan] = useState('yearly')
+  const [closing, setClosing] = useState(false)
+  const [purchasing, setPurchasing] = useState(false)
+  const [mounted, setMounted] = useState(open)
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true)
+      setClosing(false)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!mounted) return
+    if (open) {
+      document.body.style.overflow = 'hidden'
+    }
+    return () => {
+      document.body.style.overflow = ''
+    }
+  }, [mounted, open])
+
+  const requestClose = () => {
+    if (purchasing) return
+    setClosing(true)
+    setTimeout(() => {
+      setMounted(false)
+      setClosing(false)
+      onClose && onClose()
+    }, 260)
+  }
+
+  const handleStartPremium = () => {
+    if (purchasing) return
+    setPurchasing(true)
+    // Simulated purchase flow — wire this up to your real IAP / billing provider.
+    setTimeout(() => {
+      setPurchasing(false)
+      onSubscribe && onSubscribe(selectedPlan)
+    }, 900)
+  }
+
+  const plans = useMemo(
+    () => ({
+      monthly: { price: '$4.99', period: '/month', sub: 'Cancel anytime.' },
+      yearly: { price: '$3.99', period: '/month', sub: 'billed annually' },
+    }),
+    []
+  )
+
+  if (!mounted) return null
+
+  return (
+    <div className={`pw-root pw-backdrop ${closing ? 'pw-closing' : ''}`} onClick={requestClose}>
+      <div
+        className={`pw-sheet ${closing ? 'pw-closing' : ''}`}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="NutriAI Premium"
+      >
+        <div className="pw-grabber" />
+        <button className="pw-close-x" onClick={requestClose} aria-label="Close">
+          <X size={17} />
+        </button>
+
+        {/* Header */}
+        <div className="pw-header">
+          <div className="pw-crown-wrap">
+            <Crown size={32} color="#00C98D" strokeWidth={1.6} />
+          </div>
+          <h2 className="pw-title">Unlock NutriAI Premium</h2>
+          <p className="pw-subtitle">
+            You've used all {scanLimit} free AI scans. Continue tracking your nutrition without limits.
+          </p>
+          <div className="pw-used-badge">
+            <span className="pw-dot" />
+            {Math.min(scansUsed, scanLimit)} of {scanLimit} Free Scans Used
+          </div>
+        </div>
+
+        {/* Benefits */}
+        <div className="pw-benefits">
+          {BENEFITS.map((b, i) => {
+            const Icon = b.icon
+            return (
+              <div
+                key={b.label}
+                className="pw-benefit-card"
+                style={{ animationDelay: `${0.12 + i * 0.05}s` }}
+              >
+                <div className="pw-benefit-icon">
+                  <Icon size={15} strokeWidth={2} />
+                </div>
+                <div className="pw-benefit-text">{b.label}</div>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* Pricing */}
+        <div className="pw-pricing">
+          <div
+            className={`pw-plan-card pw-monthly ${selectedPlan === 'monthly' ? 'pw-selected' : ''}`}
+            style={{ animationDelay: '0.5s' }}
+            onClick={() => setSelectedPlan('monthly')}
+            role="button"
+            tabIndex={0}
+          >
+            <div className="pw-radio"><div className="pw-radio-dot" /></div>
+            <div className="pw-plan-name">Monthly</div>
+            <div className="pw-plan-price-row">
+              <span className="pw-plan-price">{plans.monthly.price}</span>
+              <span className="pw-plan-period">{plans.monthly.period}</span>
+            </div>
+            <div className="pw-plan-sub">{plans.monthly.sub}</div>
+          </div>
+
+          <div
+            className={`pw-plan-card pw-yearly ${selectedPlan === 'yearly' ? 'pw-selected' : ''}`}
+            style={{ animationDelay: '0.56s' }}
+            onClick={() => setSelectedPlan('yearly')}
+            role="button"
+            tabIndex={0}
+          >
+            <div className="pw-best-value">🔥 BEST VALUE</div>
+            <div className="pw-radio"><div className="pw-radio-dot" /></div>
+            <div className="pw-plan-name">Yearly</div>
+            <div className="pw-plan-price-row">
+              <span className="pw-plan-price">{plans.yearly.price}</span>
+              <span className="pw-plan-period">{plans.yearly.period}</span>
+            </div>
+            <div className="pw-plan-sub">{plans.yearly.sub}</div>
+            <span className="pw-save-pill">Save 20%</span>
+          </div>
+        </div>
+
+        {/* CTA */}
+        <button
+          className={`pw-cta ${purchasing ? 'pw-loading' : ''}`}
+          onClick={handleStartPremium}
+        >
+          {purchasing ? (
+            <span className="pw-spinner" />
+          ) : (
+            <>
+              <Crown size={18} strokeWidth={2} />
+              Start Premium
+            </>
+          )}
+        </button>
+
+        <div className="pw-secure-note">
+          <ShieldCheck size={12} style={{ verticalAlign: '-2px', marginRight: 4 }} />
+          Secure checkout · No hidden fees
+        </div>
+
+        <div className="pw-footer-links">
+          <button className="pw-link-btn" onClick={() => onSubscribe && onSubscribe('restore')}>
+            Restore Purchases
+          </button>
+          <button className="pw-link-btn" onClick={requestClose}>
+            Maybe Later
+          </button>
+          <div className="pw-legal-row">
+            <button onClick={() => window.open('#', '_blank')}>Privacy Policy</button>
+            <button onClick={() => window.open('#', '_blank')}>Terms of Service</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
